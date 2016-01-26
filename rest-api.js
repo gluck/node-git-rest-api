@@ -7,7 +7,10 @@ var express = require('express'),
     dgit = require('./lib/deferred-git'),
     gitParser = require('./lib/git-parser'),
     addressParser = require('./lib/address-parser'),
-    dfs = require('./lib/deferred-fs');
+    dfs = require('./lib/deferred-fs'),
+    Rx = require('rx'),
+    RxNode = require('rx-node'),
+    RxNodeExtra = require('rx-node-extra');
 
 defaultConfig = {
   prefix: '',
@@ -15,9 +18,14 @@ defaultConfig = {
   installMiddleware: false,
 };
 
+var rxGit = function(repoPath, args) {
+  logger.info('in ' + repoPath + ': running git with: ' + args);
+  return RxNodeExtra.spawn('git', ['-c', 'color.ui=false', '-c', 'core.quotepath=false', '-c', 'core.pager=cat'].concat(args), { cwd: repoPath }).map(function(data) { return data.toString(); });
+}
+
 var logger = new (winston.Logger)({
   transports: [
-    new (winston.transports.Console)({ level: 'error' }),
+    new (winston.transports.Console)({ level: 'info' }),
   ],
 });
 
@@ -75,15 +83,11 @@ function prepareGitVars(req, res, next) {
 }
 
 function getWorkdir(req, res, next) {
-  var workDir = req.signedCookies.workDir;
+  var workDir = config.tmpDir;
 
   dfs.exists(workDir)
     .then(function (exists) { if (!exists) return Q.reject('not exists'); })
-    .catch(function () {
-      // XXX who gonna clean it?
-      workDir = temp.mkdirSync({ dir: config.tmpDir });
-      res.cookie('workDir', workDir, { signed: true });
-    }).then(function() {
+    .then(function() {
       req.git.workDir = workDir;
       logger.info('work dir:', req.git.workDir);
       next();
@@ -95,6 +99,21 @@ function getRepoName(val) {
   if (!val) return null;
   match = /^[-._a-z0-9]*$/i.exec(String(val));
   return match ? match[0] : null;
+}
+
+function getRepos(req, res, next) {
+  var repo = req.params.repos;
+  var workDir = req.git.workDir;
+  if (repo.startsWith("^")){
+    var match = new RegExp(repo);
+    dfs.readdir(workDir)
+      .then(
+        function(repoList) { req.git.trees = repoList.filter(function(dir) { return match.exec(dir); }); next(); },
+        function(error) { reg.json(400, { error: error }); });
+  } else {
+    req.git.trees = [ repo ];
+    next();
+  }
 }
 
 function getRepo(req, res, next) {
@@ -176,319 +195,83 @@ app.get(config.prefix + '/',
     );
 });
 
-/* POST /init
- * 
- * Request:
- *   json: {
- *     "repo": <local-repo-name>,
- *     ("bare": <bool, --bare>,)
- *     ("shared": <bool, --share>,)
- *   }
+/* GET /repo/:repo
+ *
  * Response:
- *   json: { "repo": <local repo name> }
+ *   json: {}
  * Error:
  *   json: { "error": <error> }
  */
-app.post(config.prefix + '/init',
-  [prepareGitVars, getWorkdir],
+app.get(config.prefix + '/repo/:repos',
+  [prepareGitVars, getWorkdir, getRepos],
   function(req, res)
 {
-  var repo = req.body.repo || '';
-  var bare = req.body.bare ? '--bare' : '';
-  var shared = req.body.shared ? '--shared' : '';
+  var repos = req.git.trees;
 
-  logger.info('init repo:', repo, bare, shared, ';', req.git);
+  logger.info('get repos:', req.git.trees);
 
-  if (!getRepoName(repo)) {
-      res.json(400, { error: 'Invalid repo name: ' + repo });
-      return;
+  res.json(200, repos);
+});
+
+var getBranches = function(repoDir, spec) {
+  if (spec[0] == '^') {
+    var match = new RegExp(spec);
+    return rxGit(repoDir, ['branch', '--list'])
+      .flatMap(function(data) { return gitParser.parseGitBranches(data);})
+      .map(function(br) { return br.name; })
+      .filter(function(br) { return match.exec(br); })
+      .toArray();
+  } else {
+    return Rx.Observable.return([spec]);
   }
+}
 
-  var repoDir = path.join(req.git.workDir, repo);
-  dfs.exists(repoDir)
-    .then(function (exists) {
-      if (exists) return Q.reject('A repository ' + repo + ' already exists');
+var observeToResponse = function(res) {
+  return Rx.Observer.create(function(val) {
+      var replacer = app.get('json replacer');
+      var spaces = app.get('json spaces');
+      var body = JSON.stringify(val, replacer, spaces);
+      var first = !res.headersSent;
+      if (first) {
+        res.status(200).set('Content-Type', 'application/json');
+        res.write('[');
+      } else {
+        res.write(',');
+      }
+      res.write(body);
+    }, function(e) {
+      if (res.headersSent) {
+        throw e;
+      } else {
+        res.status(400).json({ error: e });
+      }
+    }, function() {
+      res.write(']');
+      res.end();
     })
-    .then(function() { return dfs.mkdir(repoDir); })
-    .then(function() {
-      return dgit('init ' + bare + ' ' + shared, repoDir);
-    }).then(
-      function() { res.json(200, { repo: repo }); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
+}
 
-/* POST /clone
- * 
- * Request:
- *   json: {
- *     "remote": <remote-url>,
- *     ("repo": <local-repo-name>,)
- *     ("bare": <git's --bare>,)
- *   }
- *
- * Response:
- *   json: { "repo": <local repo name> }
- * Error:
- *   json: { "error": <error> }
- */
-app.post(config.prefix + '/clone',
-  [prepareGitVars, getWorkdir],
+app.get(config.prefix + '/repo/:repos/grep/:branches',
+  [prepareGitVars, getWorkdir, getRepos],
   function(req, res)
 {
-  logger.info('clone repo:', req.body.remote);
-
-  if (!req.body.remote) {
-      res.json(400, { error: 'Empty remote url' });
-      return;
-  }
-
-  var remote = addressParser.parseAddress(req.body.remote);
-  var repo = req.body.repo || remote.shortProject;
-  if (!getRepoName(repo)) {
-      res.json(400, { error: 'Invalid repo name: ' + repo });
-      return;
-  }
-
-  var workDir = req.git.workDir;
-  var repoDir = path.join(workDir, repo);
-  var flags = '';
-
-  if (req.body.bare) flags = flags + ' --bare';
-
-  dfs.exists(repoDir)
-    .then(function (exists) {
-      if (exists) return Q.reject('A repository ' + repo + ' already exists');
+  var repos = req.git.trees;
+  var q    = req.query.q    || '.';
+  var file = req.query.path || '*';
+  var ignore_case = req.query.ignore_case ? ['-i'] : [];
+  var pattern_type = req.query.pattern_type || 'basic';
+  Rx.Observable.from(repos)
+    .flatMap(function(repo) {
+      var repoDir = path.join(req.git.workDir, repo);
+      return getBranches(repoDir, req.params.branches)
+        .flatMap(function(list) {
+          return rxGit(repoDir, ['-c', 'grep.patternType=' + pattern_type, 'grep', '-In'].concat(ignore_case).concat([q]).concat(list).concat(['--', file]))
+            .flatMap(function(data) { return gitParser.parseGitGrep(data);});
+        });
     })
-    .then(function() {
-      return dgit('clone ' + flags + ' ' + remote.address + ' ' + repo, workDir);
-    })
-    .then(
-      function() { res.json(200, { repo: repo }); },
-      function(error) { res.json(400, { error: error }); }
-    );
+    .subscribe(observeToResponse(res));
 });
 
-/* DELETE /repo/:repo
- *
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.delete(config.prefix + '/repo/:repo',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-
-  logger.info('delete repo:', req.git.tree.repo);
-
-  dfs.rmrfdir(repoDir)
-    .then(
-      function() { res.json(200, {}); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* GET /repo/:repo/config?name=<option name>
- *
- * Response:
- *   json: {
- *     "values": [<option value>*]
- *   }
- * Error:
- *   json: { "error": <error> }
- */
-app.get(config.prefix + '/repo/:repo/config',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var name = req.query.name || '';
-
-  logger.info('config get', name);
-
-  dgit('config --local --get-all ' + name, repoDir, gitParser.parseGitConfig)
-    .then(
-      function(values) { res.json(200, { values: values }); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* POST /repo/:repo/config
- *
- * Requst:
- *   json: {
- *     "name": <option name>,
- *     "value": <option value>,
- *   }
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.post(config.prefix + '/repo/:repo/config',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var name = req.body.name || '';
-  var value = req.body.value || '';
-
-  logger.info('config add', name, value);
-
-  dgit('config --local --add ' + name + ' ' + value, repoDir)
-    .then(
-      function() { res.json(200, {}); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* PUT /repo/:repo/config
- *
- * Requst:
- *   json: {
- *     "name": <option name>,
- *     "value": <option value>,
- *   }
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.put(config.prefix + '/repo/:repo/config',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var name = req.body.name || '';
-  var value = req.body.value || '';
-
-  logger.info('config add', name, value);
-
-  dgit('config --local --replace-all ' + name + ' ' + value, repoDir)
-    .then(
-      function() { res.json(200, {}); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* DELETE /repo/:repo/config
- *
- * Requst:
- *   json: {
- *     "name": <option name>,
- *     "unset-all": <whether unset all values>,
- *   }
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.delete(config.prefix + '/repo/:repo/config',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var name = req.body.name || '';
-  var unset = '--unset';
-
-  logger.info('config unset', name);
-
-  if (req.body['unset-all']) unset = '--unset-all';
-
-  dgit('config --local ' + unset + ' ' + name, repoDir)
-    .then(
-      function() { res.json(200, {}); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* GET /repo/:repo/remote
- *
- * Response:
- *   json: {
- *     [
- *       ({
- *         "name": <remote name>,
- *         "url": <remote URL>
- *       })*
- *     ]
- *   }
- * Error:
- *   json: { "error": <error> }
- */
-app.get(config.prefix + '/repo/:repo/remote',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-
-  logger.info('list remotes');
-
-  dgit('remote -v', repoDir, gitParser.parseGitRemotes)
-    .then(
-      function(remotes) { res.json(200, remotes); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* POST /repo/:repo/remote
- *
- * Request:
- *   json: {
- *     "name": <remote name>,
- *     "url": <remote URL>
- *   }
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.post(config.prefix + '/repo/:repo/remote',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var name = req.body.name || '';
-  var url = req.body.url || '';
-
-  logger.info('add remote', name, url);
-
-  dgit('remote add ' + name + ' ' + url, repoDir)
-    .then(
-      function() { res.json(200, {}); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* DELETE /repo/:repo/remote
- *
- * Request:
- *   json: {
- *     "name": <remote name>
- *   }
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.delete(config.prefix + '/repo/:repo/remote',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var name = req.body.name;
-
-  logger.info('rem remote', name);
-
-  dgit('remote rm ' + name, repoDir)
-    .then(
-      function() { res.json(200, {}); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
 
 /* GET /repo/:repo/branch
  *
@@ -515,104 +298,6 @@ app.get(config.prefix + '/repo/:repo/branch',
   dgit('branch --list', repoDir, gitParser.parseGitBranches)
     .then(
       function(branches) { res.json(200, branches); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* POST /repo/:repo/branch
- * 
- * Request:
- *  { "branch": <branch name> }
- *
- * Response:
- *   json: { "branch": <branch name> }
- * Error:
- *   json: { "error": <error> }
- */
-app.post(config.prefix + '/repo/:repo/branch',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var branch = req.body.branch;
-
-  logger.info('create branch:', branch);
-
-  if (!branch) {
-    res.json(400, { error: 'No branch name is specified' });
-    return;
-  }
-
-  dgit('branch ' + branch, repoDir)
-    .then(
-      function() { res.json(200, { branch: branch }); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* POST /repo/:repo/checkout
- * 
- * Request:
- *  { "branch": <branch name> }
- *
- * Response:
- *   json: { "branch": <branch name> }
- * Error:
- *   json: { "error": <error> }
- */
-app.post(config.prefix + '/repo/:repo/checkout',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var branch = req.body.branch;
-
-  logger.info('checkout branch:', branch);
-
-  if (!branch) {
-    res.json(400, { error: 'No branch name is specified' });
-    return;
-  }
-
-  dfs.exists(repoDir + '/.git/refs/heads/' + branch)
-    .then(function (exists) {
-      if (!exists) return Q.reject('Unknown branch ' + branch);
-    })
-    .then(function() {
-      return dgit('checkout ' + branch, repoDir);
-    })
-    .then(
-      function() { res.json(200, { branch: branch }); },
-      function(error) { res.json(400, { error: error }); }
-    );
-});
-
-/* POST /repo/:repo/mv
- * 
- * Request:
- *  json: {
- *    "source": <path>,
- *    "destination": <path>
- *  }
- *
- * Response:
- *   json: { "branch": <branch name> }
- * Error:
- *   json: { "error": <error> }
- */
-app.post(config.prefix + '/repo/:repo/mv',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var src = req.body.source;
-  var dst = req.body.destination;
-
-  logger.info('move: ', src, '->', dst);
-
-  dgit('mv ' + src + ' ' + dst, repoDir)
-    .then(
-      function() { res.json(200, {}); },
       function(error) { res.json(400, { error: error }); }
     );
 });
@@ -732,180 +417,6 @@ app.get(config.prefix + '/repo/:repo/log',
   dgit('log  --decorate=full --pretty=fuller --all --parents', repoDir,
     gitParser.parseGitLog).then(
       function (log) { res.json(200, log); },
-      function (error) { res.json(400, { error: error }); }
-    );
-});
-
-/* POST /repo/:repo/commit
- * 
- * Request:
- *  json: {
- *    "allow-empty": (true or false),
- *    "message": <commit message>
- *  }
- *
- * Response:
- *   json: {
- *     "branch": <branch name>,
- *     "sha1": <commit sha>,
- *     "title": <commit title>
- *   }
- * Error:
- *   json: { "error": <error> }
- */
-app.post(config.prefix + '/repo/:repo/commit',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var message = req.body.message;
-  var repoDir = req.git.tree.repoDir;
-  var cmdOptions = '';
-
-  logger.info('commit message:', message);
-
-  if (!message) {
-    res.json(400, { error: 'Empty commit message' });
-    return;
-  }
-
-  cmdOptions = '-m "' + message + '"';
-  if (req.body['allow-empty']) cmdOptions += ' --allow-empty';
-
-  dgit('commit ' + cmdOptions, repoDir, gitParser.parseCommit)
-    .then(
-      function (commit) { res.json(200, commit); },
-      function (error) { res.json(400, { error: error }); }
-    );
-});
-
-/* POST /repo/:repo/push
- * 
- * Request:
- *   json: { ({"remote": <remote name>, "branch": <branch name>}) }
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.post(config.prefix + '/repo/:repo/push',
-  [prepareGitVars, getWorkdir, getRepo],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var remote = req.body.remote || 'origin';
-  var branch = req.body.branch || '';
-
-  dgit('push ' + remote + ' ' + branch, repoDir)
-    .then(
-      function (obj) { res.json(200, obj); },
-      function (error) { res.json(400, { error: error }); }
-    );
-});
-
-/* GET /repo/:repo/tree/<path>
- * 
- * Response:
- *   json: {
- *     "name": <name>,
- *     "type": ("dir" or "file"),
- *     "status": '', (XXX not implemented)
- *     "contents": (for dirs only)
- *   }
- * Error:
- *   json: { "error": <error> }
- */
-app.get(config.prefix + '/repo/:repo/tree/*',
-  [prepareGitVars, getWorkdir, getRepo, getFilePath],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var file = req.git.file.path;
-  var fileFullPath = path.join(repoDir, file);
-
-  logger.info('get file: ' + file);
-
-  dfs.exists(fileFullPath)
-    .then(function (exists) {
-      if (!exists) return Q.reject('No such file: ' + fileFullPath);
-    })
-    .then(function() { return dfs.stat(fileFullPath) })
-    .then(function(stats) {
-      if (stats.isFile()) {
-        return dfs.readFile(fileFullPath)
-	  .then(function (buffer) { res.send(200, buffer); });
-      }
-      if (stats.isDirectory()) {
-	return dgit.lsR(fileFullPath)
-	  .then(function (obj) { res.json(200, obj); });
-      }
-      return Q.reject('Not a regular file or a directory ' + file);
-    })
-    .catch(function (error) { res.json(400, { error: error }); });
-});
-
-/* PUT /repo/:repo/tree/<path>
- * 
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.put(config.prefix + '/repo/:repo/tree/*',
-  [prepareGitVars, getWorkdir, getRepo, getFilePath],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var file = req.git.file.path;
-  var fileFullPath = path.join(repoDir, file);
-  var tmpPath = req.files && req.files.file ? req.files.file.path : null;
-
-  if (!tmpPath) {
-    res.json(400, { error: 'No file uploaded' });
-    return;
-  }
-
-  dfs.exists(fileFullPath)
-    .then(function (exists) {
-      if (!exists) return dfs.mkdirp(path.dirname(fileFullPath), 0755);
-      return dfs.stat(fileFullPath).then(function (stats) {
-	if (!stats.isFile()) return Q.reject('Not a regular file: ' + file);
-      });
-    })
-    .then(function () {
-      var dstPath = path.join(repoDir, file);
-      /* If rename fails, try to copy the file. Rename plays with links and
-       * hence can fail when the source and the destination lye on different
-       * file systems.
-       */
-      return dfs.rename(tmpPath, dstPath)
-        .catch(function (err) { return dfs.copy(tmpPath, dstPath); });
-      })
-    .then(function() { return dgit('add ' + file, repoDir); })
-    .then(
-      function () { res.json(200, {}); },
-      function (error) { res.json(400, { error: error }); }
-    );
-});
-
-/* DELETE /repo/:repo/tree/<path>
- * 
- * Response:
- *   json: {}
- * Error:
- *   json: { "error": <error> }
- */
-app.delete(config.prefix + '/repo/:repo/tree/*',
-  [prepareGitVars, getWorkdir, getRepo, getFilePath],
-  function(req, res)
-{
-  var repoDir = req.git.tree.repoDir;
-  var file = req.git.file.path;
-
-  logger.info('del file:', file);
-
-  dgit('rm -rf ' + file, repoDir)
-    .then(
-      function () { res.json(200, {}); },
       function (error) { res.json(400, { error: error }); }
     );
 });
