@@ -242,11 +242,12 @@ var getBranches = function(repoDir, spec) {
 }
 
 var observeToResponse = function(res) {
+  var first = true;
+  var replacer = app.get('json replacer');
+  var spaces = app.get('json spaces');
   return Rx.Observer.create(function(val) {
-      var replacer = app.get('json replacer');
-      var spaces = app.get('json spaces');
       var body = JSON.stringify(val, replacer, spaces);
-      var first = !res.headersSent;
+      first = !res.headersSent;
       if (first) {
         res.status(200).set('Content-Type', 'application/json');
         res.write('[');
@@ -261,6 +262,10 @@ var observeToResponse = function(res) {
         res.status(400).json({ error: e });
       }
     }, function() {
+      if (first) {
+        res.status(200).set('Content-Type', 'application/json');
+        res.write('[');
+      }
       res.write(']');
       res.end();
     })
@@ -285,7 +290,7 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
                 var ret = parseGitGrep(line);
                 ret.repo = repo;
                 return ret;
-            });
+            }).catch(Rx.Observable.empty());
         });
     })
     .subscribe(observeToResponse(res));
