@@ -10,7 +10,8 @@ var express = require('express'),
     dfs = require('./lib/deferred-fs'),
     Rx = require('rx'),
     RxNode = require('rx-node'),
-    RxNodeExtra = require('rx-node-extra');
+    RxNodeExtra = require('rx-node-extra'),
+    cors = require('cors');
 
 defaultConfig = {
   prefix: '',
@@ -20,7 +21,9 @@ defaultConfig = {
 
 var rxGit = function(repoPath, args) {
   logger.info('in ' + repoPath + ': running git with: ' + args);
-  return RxNodeExtra.spawn('git', ['-c', 'color.ui=false', '-c', 'core.quotepath=false', '-c', 'core.pager=cat'].concat(args), { cwd: repoPath }).map(function(data) { return data.toString(); });
+  return RxNodeExtra.spawn('git', ['-c', 'color.ui=false', '-c', 'core.quotepath=false', '-c', 'core.pager=cat'].concat(args), { cwd: repoPath })
+      .flatMap(function(data) { return data.toString().split('\n'); })
+      .filter(function(line) { return line.trim() != ''; } );
 }
 
 var logger = new (winston.Logger)({
@@ -71,6 +74,7 @@ if (config.installMiddleware) {
   app.use(express.bodyParser({ uploadDir: '/tmp', keepExtensions: true }));
   app.use(express.methodOverride());
   app.use(express.cookieParser('a-random-string-comes-here'));
+  app.use(cors());
 }
 
 function prepareGitVars(req, res, next) {
@@ -213,12 +217,23 @@ app.get(config.prefix + '/repo/:repos',
   res.json(200, repos);
 });
 
+var parseGitGrep = function(line) {
+  var split = line.split(':');
+  return { branch: split[0], file: split[1], line_no: split[2], line: split.splice(3).join(':')};
+}
+
+var parseGitBranch = function(text) {
+  if (row.trim() == '') return;
+  var branch = { name: row.slice(2) };
+  if(row[0] == '*') branch.current = true;
+  return branch;
+}
+
 var getBranches = function(repoDir, spec) {
   if (spec[0] == '^') {
     var match = new RegExp(spec);
     return rxGit(repoDir, ['branch', '--list'])
-      .flatMap(function(data) { return gitParser.parseGitBranches(data);})
-      .map(function(br) { return br.name; })
+      .map(function(line) { return parseGitBranch(line).name;})
       .filter(function(br) { return match.exec(br); })
       .toArray();
   } else {
@@ -266,7 +281,11 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
       return getBranches(repoDir, req.params.branches)
         .flatMap(function(list) {
           return rxGit(repoDir, ['-c', 'grep.patternType=' + pattern_type, 'grep', '-In'].concat(ignore_case).concat([q]).concat(list).concat(['--', file]))
-            .flatMap(function(data) { return gitParser.parseGitGrep(data);});
+            .map(function(line) {
+                var ret = parseGitGrep(line);
+                ret.repo = repo;
+                return ret;
+            });
         });
     })
     .subscribe(observeToResponse(res));
