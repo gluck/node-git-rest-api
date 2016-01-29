@@ -332,10 +332,10 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
   var ignore_case = req.query.ignore_case ? ['-i'] : [];
   var pattern_type = req.query.pattern_type || 'basic';
   Rx.Observable.from(repos)
-    .flatMap(function(repo) {
+    .concatMap(function(repo) {
       var repoDir = path.join(req.git.workDir, repo);
       return getBranches(repoDir, req.params.branches)
-        .flatMap(function(list) {
+        .concatMap(function(list) {
           return rxGit(repoDir, ['-c', 'grep.patternType=' + pattern_type, 'grep', '-In'].concat(ignore_case).concat([q]).concat(list).concat(['--', file]))
             .map(function(line) {
                 var ret = parseGitGrep(line);
