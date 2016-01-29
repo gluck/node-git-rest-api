@@ -1,8 +1,9 @@
-var express = require('express'),
+const  express = require('express'),
     fs = require('fs'),
     path = require('path'),
     temp = require('temp'),
     Q = require('q'),
+    _ = require('lodash'),
     winston = require('winston'),
     dgit = require('./lib/deferred-git'),
     gitParser = require('./lib/git-parser'),
@@ -10,8 +11,8 @@ var express = require('express'),
     dfs = require('./lib/deferred-fs'),
     Rx = require('rx'),
     RxNode = require('rx-node'),
-    RxNodeExtra = require('rx-node-extra'),
-    cors = require('cors');
+    cors = require('cors'),
+    VError = require('verror');
 
 defaultConfig = {
   prefix: '',
@@ -19,18 +20,68 @@ defaultConfig = {
   installMiddleware: false,
 };
 
-var rxGit = function(repoPath, args) {
-  logger.info('in ' + repoPath + ': running git with: ' + args);
-  return RxNodeExtra.spawn('git', ['-c', 'color.ui=false', '-c', 'core.quotepath=false', '-c', 'core.pager=cat'].concat(args), { cwd: repoPath })
-      .flatMap(function(data) { return data.toString().split('\n'); })
-      .filter(function(line) { return line.trim() != ''; } );
-}
+const spawn = require('child_process').spawn;
 
 var logger = new (winston.Logger)({
   transports: [
-    new (winston.transports.Console)({ level: 'info' }),
+    new (winston.transports.Console)({ level: 'info', timestamp: true }),
   ],
 });
+
+var rxSpawn = function(cmd, args, options) {
+    var obs =  Rx.Observable.create(function(observer) {
+      var remainder = '';
+      function dataHandler(data) {
+        var str = data.toString();
+        var arr = str.split('\n');
+        if (remainder != '') {
+          arr[0] = remainder + arr[0];
+          remainder = '';
+        }
+        if (!str.endsWith('\n')) {
+          remainder = arr[arr.length - 1];
+          arr = arr.slice(0, arr.length - 1);
+        }
+        arr.forEach(function(line) { observer.onNext(line); });
+      }
+
+      function errorHandler(err) {
+        var newError = new VError(err, `spawn error for ${cmd}`);
+        console.error(newError.stack);
+        observer.onError(newError);
+      }
+
+      function endHandler(code) {
+        if (!_.isNumber(code) || code >= 2) {
+          var err = new VError(`spawn error: ${cmd} process exited with code ${code}`);
+          console.error(err.stack);
+        }
+        if (remainder != '') {
+          observer.onNext(remainder);
+          remainder = '';
+        }
+        observer.onCompleted();
+      }
+
+      logger.info(`Running ${cmd} in ${options.cwd} with args: ${args.join(' ')}`);
+      var childProcess = spawn(cmd, args, options);
+
+      childProcess.stdout.addListener('data', dataHandler);
+      childProcess.stderr.addListener('data', errorHandler);
+      childProcess.addListener('close', endHandler);
+
+      return function() {
+        childProcess.kill();
+      };
+    });
+    return obs.publish().refCount();
+  };
+
+var rxGit = function(repoPath, args) {
+  return rxSpawn('git', ['-c', 'color.ui=false', '-c', 'core.quotepath=false', '-c', 'core.pager=cat'].concat(args), { cwd: repoPath, stdio: ['ignore', 'pipe', 'pipe'] })
+      //.flatMap(function(data) { return data.toString().split('\n'); })
+      .filter(function(line) { return line.trim() != ''; } );
+}
 
 function mergeConfigs(dst, src) {
   /* XXX good enough */
@@ -290,7 +341,7 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
                 var ret = parseGitGrep(line);
                 ret.repo = repo;
                 return ret;
-            }).catch(Rx.Observable.empty());
+            }).onErrorResumeNext(Rx.Observable.empty());
         });
     })
     .subscribe(observeToResponse(res));
