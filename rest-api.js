@@ -331,6 +331,7 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
   var file = req.query.path || '*';
   var ignore_case = req.query.ignore_case ? ['-i'] : [];
   var pattern_type = req.query.pattern_type || 'basic';
+  var close = Rx.Observable.fromEvent(req, 'close');
   Rx.Observable.from(repos)
     .concatMap(function(repo) {
       var repoDir = path.join(req.git.workDir, repo);
@@ -344,6 +345,7 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
             }).onErrorResumeNext(Rx.Observable.empty());
         });
     })
+    .takeUntil(close)
     .subscribe(observeToResponse(res));
 });
 
