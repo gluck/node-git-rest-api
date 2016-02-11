@@ -23,6 +23,10 @@ GET /repo/^foo/grep/HEAD?q=SOMETHING&path=*.md
   } ... ]
 ```
 
+## Frontend
+
+You can use this service from the [git-grep-client](https://github.com/Ullink/git-grep-client) React UI.
+
 ## Install
 
 You can run it manually using `npm run start`, or use [forever](https://www.npmjs.com/package/forever) to keep it running.
