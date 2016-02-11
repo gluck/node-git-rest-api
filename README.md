@@ -1,54 +1,28 @@
 # GIT REST API
 
-[![Build Status](https://travis-ci.org/korya/node-git-rest-api.png?branch=master)](https://travis-ci.org/korya/node-git-rest-api)
+The aim of the project is to provide a restful Git API over a set of bare repositories.
 
-The aim of the project is to provide a restful Git API that
-mimics as most as possible the old good git.
-
-For example, in order to commit a change in shell you should do:
 ```shell
-$ mkdir new-project
-$ cd new-project
-$ git init
-$ git add file.c
-$ git commit -m 'A commit message'
-$ git add file.c
-$ git commit -m 'A second commit message'
-$ git show HEAD~:file.c
-```
+# returns all repositories hosted
+GET /
+  [ "foo.git", "bar.git" ]
 
-In case of `git-rest-api` you should do:
-```shell
-POST /init
-  { "repo": "new-project" }
-POST /repo/new-project/tree/file.c
-POST /repo/new-project/commit
-  { "message": "A commit message" }
-POST /repo/new-project/tree/file.c
-POST /repo/new-project/commit
-  { "message": "A second commit message" }
-GET  /repo/new-project/show/file.c?rev=HEAD~
+# returns all repositories matching regexp
+GET /repo/^foo
+  [ "foo.git" ]
+  
+# the real deal comes now:
+# executes git grep over matching repositories/path/refspec and return results
+GET /repo/^foo/grep/HEAD?q=SOMETHING&path=*.md
+  [ {
+    "branch": "HEAD",
+    "file": "README.cs",
+    "line_no": "128",
+    "line": "Now this is really SOMETHING",
+    "repo": "foo.git"
+  } ... ]
 ```
 
 ## Install
 
-In your project install git-rest-api and express:
-```shell
-$ npm install git-rest-api
-$ npm install express
-```
-
-A simple example of a server running `git-rest-api`:
-```javascript
-var app = require('express')(),
-    git = require('git-rest-api');
-
-git.init(app, { installMiddleware: true }).then(function () {
-  app.listen(8080);
-  console.log('Listening on', 8080);
-});
-```
-
-## Examples
-
-## API
+You can run it manually using `npm run start`, or use [forever](https://www.npmjs.com/package/forever) to keep it running.
