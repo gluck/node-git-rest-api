@@ -38,10 +38,8 @@ var rxSpawn = function(cmd, args, options) {
           arr[0] = remainder + arr[0];
           remainder = '';
         }
-        if (!str.endsWith('\n')) {
-          remainder = arr[arr.length - 1];
-          arr = arr.slice(0, arr.length - 1);
-        }
+        remainder = arr[arr.length - 1];
+        arr = arr.slice(0, arr.length - 1);
         arr.forEach(function(line) { observer.onNext(line); });
       }
 
@@ -78,9 +76,7 @@ var rxSpawn = function(cmd, args, options) {
   };
 
 var rxGit = function(repoPath, args) {
-  return rxSpawn('git', ['-c', 'color.ui=false', '-c', 'core.quotepath=false', '-c', 'core.pager=cat'].concat(args), { cwd: repoPath, stdio: ['ignore', 'pipe', 'pipe'] })
-      //.flatMap(function(data) { return data.toString().split('\n'); })
-      .filter(function(line) { return line.trim() != ''; } );
+  return rxSpawn('git', ['-c', 'color.ui=false', '-c', 'core.quotepath=false', '-c', 'core.pager=cat'].concat(args), { cwd: repoPath, stdio: ['ignore', 'pipe', 'pipe'] });
 }
 
 function mergeConfigs(dst, src) {
@@ -329,18 +325,23 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
   var file = req.query.path || '*';
   var ignore_case = req.query.ignore_case ? ['-i'] : [];
   var pattern_type = req.query.pattern_type || 'basic';
+  var target_line_no = req.query.target_line_no || 0;
   var close = Rx.Observable.fromEvent(req, 'close');
   Rx.Observable.from(repos)
     .concatMap(function(repo) {
       var repoDir = path.join(req.git.workDir, repo);
       return getBranches(repoDir, req.params.branches)
         .concatMap(function(list) {
-          return rxGit(repoDir, ['-c', 'grep.patternType=' + pattern_type, 'grep', '-In'].concat(ignore_case).concat([q]).concat(list).concat(['--', file]))
+          var greps = rxGit(repoDir, ['-c', 'grep.patternType=' + pattern_type, 'grep', '-In'].concat(ignore_case).concat([q]).concat(list).concat(['--', file]))
             .map(function(line) {
                 var ret = parseGitGrep(line);
                 ret.repo = repo;
                 return ret;
             }).onErrorResumeNext(Rx.Observable.empty());
+          if (target_line_no == 0) {
+            return greps;
+          }
+          return greps.filter(function(grep) { return grep.line_no == target_line_no; });
         });
     })
     .takeUntil(close)
