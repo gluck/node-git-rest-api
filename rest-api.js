@@ -293,13 +293,11 @@ var getBranches = function(repoDir, spec) {
 }
 
 var observeToResponse = function(res) {
-  var first = true;
   var replacer = app.get('json replacer');
   var spaces = app.get('json spaces');
   return Rx.Observer.create(function(val) {
       var body = JSON.stringify(val, replacer, spaces);
-      first = !res.headersSent;
-      if (first) {
+      if (!res.headersSent) {
         res.status(200).set('Content-Type', 'application/json');
         res.write('[');
       } else {
@@ -313,7 +311,7 @@ var observeToResponse = function(res) {
         res.status(400).json({ error: e });
       }
     }, function() {
-      if (first) {
+      if (!res.headersSent) {
         res.status(200).set('Content-Type', 'application/json');
         res.write('[');
       }
