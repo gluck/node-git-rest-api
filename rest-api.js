@@ -121,7 +121,7 @@ if (config.installMiddleware) {
   app.use(express.bodyParser({ uploadDir: '/tmp', keepExtensions: true }));
   app.use(express.methodOverride());
   app.use(express.cookieParser('a-random-string-comes-here'));
-  app.use(cors());
+  app.use(cors({exposedHeaders: ['Transfer-Encoding']}));
 }
 
 function prepareGitVars(req, res, next) {
@@ -288,16 +288,18 @@ var getBranches = function(repoDir, spec) {
   }
 }
 
-var observeToResponse = function(res) {
+var observeToResponse = function(res, delimiter) {
   var replacer = app.get('json replacer');
   var spaces = app.get('json spaces');
+  var noDelim = delimiter === '';
   return Rx.Observer.create(function(val) {
       var body = JSON.stringify(val, replacer, spaces);
       if (!res.headersSent) {
         res.status(200).set('Content-Type', 'application/json');
-        res.write('[');
+        if (noDelim) res.write('[');
       } else {
-        res.write(',');
+        if (noDelim) res.write(',');
+        else res.write(delimiter);
       }
       res.write(body);
     }, function(e) {
@@ -309,9 +311,9 @@ var observeToResponse = function(res) {
     }, function() {
       if (!res.headersSent) {
         res.status(200).set('Content-Type', 'application/json');
-        res.write('[');
+        if (noDelim) res.write('[');
       }
-      res.write(']');
+      if (noDelim) res.write(']');
       res.end();
     })
 }
@@ -326,6 +328,7 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
   var ignore_case = req.query.ignore_case ? ['-i'] : [];
   var pattern_type = req.query.pattern_type || 'basic';
   var target_line_no = req.query.target_line_no || 0;
+  var delimiter = req.query.delimiter || '';
   var close = Rx.Observable.fromEvent(req, 'close');
   Rx.Observable.from(repos)
     .concatMap(function(repo) {
@@ -345,7 +348,7 @@ app.get(config.prefix + '/repo/:repos/grep/:branches',
         });
     })
     .takeUntil(close)
-    .subscribe(observeToResponse(res));
+    .subscribe(observeToResponse(res, delimiter));
 });
 
 
