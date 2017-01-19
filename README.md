@@ -1,3 +1,7 @@
+# This is not the project you are looking for !
+
+[This one is](https://github.com/Ullink/git-bare-node-rest-api)
+
 # GIT REST API
 
 The aim of the project is to provide a restful Git API over a set of bare repositories.
